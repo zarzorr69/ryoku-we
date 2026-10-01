@@ -1,0 +1,1446 @@
+#!/usr/bin/env python3
+"""
+Ryoku-WE
+
+Unified Ryoku wallpaper support + TUI.
+
+Validated routing:
+  Pictures / stills        -> native Ryoku
+  Local GIFs               -> native Ryoku + AnimatedImage patch
+  Local videos             -> native Ryoku
+  Steam Workshop videos    -> native Ryoku
+  Wallpaper Engine scenes  -> we-layerd
+  Wallpaper audio          -> global mute/unmute toggle
+
+Run with no arguments to open the TUI.
+
+CLI commands (also used internally by systemd):
+  install
+  repair
+  status
+  sync
+  gif-patch
+  mute
+  unmute
+  toggle-mute
+  restart-we
+  picker
+  logo
+  uninstall
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import curses
+import io
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+from datetime import datetime
+from pathlib import Path
+
+APP_NAME = "Ryoku-WE"
+VERSION = "2.1.0"
+
+LOGO = r"""000010000010101111000011010010100100110010001101010100111010
+100011101111011011001100000011000010101001101111100001110001
+010100111100100111001110000010001000101001001010110111010000
+001001000011010001110011101110111000111000001110110100101100
+110100011010111111111001100011011111101000011110010010000111
+110001111110001111101111010001010010001010000011000000010110
+000110111000011011100101011000001111100110001011100110010100
+100111000111000011000101100010011111101010110110001101010100
+001001001110101001001001100111111110101100011100110101000110
+010001111110011000101111011010110011100000001000101110001100
+010011010000010001001111100011011001100101011010011010000001
+011100101101000110110001010100100101011001101100101111011100
+101011010111001000100010001101100000001101100001101100010111
+010111110001000010001110010001000101010011101111000010100001
+000000000110001100011010001101010011110101110110000110110101
+011000110100010100010100100111100011001100101101110111101010
+101111101000010001101000001001001001011101001010000001100010
+100110010010001111101100000000001011110001111101001010110100
+100010101110111010101100110000111011111111100111101101001011
+001001010110010001111100100001000110011111010010100110110011
+111010010000001101100110011010100100010001110000100000001100
+001001100101111111110011010100111110100000111101001011110111
+101111001011100100001101000111100010100101110001100101010000
+001100110100000100011100101110010001101000011011111000000101
+011000010011111001010010111011011001111011111011010111110000
+001110001110010100001110001011110010111101001001101000100001
+010010100011110011100001101010111001011101110010000100101000"""
+
+HOME = Path.home()
+BIN_DIR = HOME / ".local/bin"
+INSTALLED_SCRIPT = BIN_DIR / APP_NAME
+
+CONFIG_HOME = HOME / ".config"
+SYSTEMD_DIR = CONFIG_HOME / "systemd/user"
+RYOKU_CONFIG = CONFIG_HOME / "ryoku/ryogami.json"
+WE_CONFIG = CONFIG_HOME / "we-layerd/config.toml"
+
+STATE_FILE = HOME / ".local/state/ryoku-wallpaper"
+DATA_DIR = HOME / ".local/share/ryoku-we"
+BACKUP_ROOT = DATA_DIR / "backups"
+
+ACTIVE_BACKDROP = HOME / ".config/quickshell/shell/modules/wallpaper/Backdrop.qml"
+SOURCE_BACKDROP = HOME / ".local/share/ryoku/rashin/source/quickshell/shell/modules/wallpaper/Backdrop.qml"
+
+ACTIVE_SHELL = HOME / ".config/quickshell/shell/shell.qml"
+SOURCE_SHELL = HOME / ".local/share/ryoku/rashin/source/quickshell/shell/shell.qml"
+
+GIF_SERVICE = SYSTEMD_DIR / "ryoku-gif-wallpaper-patch.service"
+GIF_PATH = SYSTEMD_DIR / "ryoku-gif-wallpaper-patch.path"
+SYNC_SERVICE = SYSTEMD_DIR / "ryoku-we-sync.service"
+SYNC_PATH = SYSTEMD_DIR / "ryoku-we-sync.path"
+WE_SERVICE = SYSTEMD_DIR / "we-layerd.service"
+
+SYNTHETIC_DIR = HOME / "Pictures/Wallpapers/Wallpaper Engine"
+
+OLD_HELPERS = [
+    HOME / ".local/bin/ryoku-we-sync",
+    HOME / ".local/bin/ryoku-wallpaper-support",
+]
+
+
+def say(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def run(cmd, *, check=False, capture=False, quiet=False, timeout=None):
+    kwargs = {}
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.STDOUT
+        kwargs["text"] = True
+    elif quiet:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+
+    try:
+        return subprocess.run(
+            [str(x) for x in cmd],
+            check=check,
+            timeout=timeout,
+            **kwargs,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def systemctl(*args, quiet=True):
+    return run(["systemctl", "--user", *args], quiet=quiet)
+
+
+def command_path(name: str) -> str | None:
+    p = shutil.which(name)
+    if p:
+        return p
+    candidate = BIN_DIR / name
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+
+def timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def unit_state(unit: str) -> tuple[str, str]:
+    active = run(["systemctl", "--user", "is-active", unit], capture=True)
+    enabled = run(["systemctl", "--user", "is-enabled", unit], capture=True)
+    a = active.stdout.strip() if active and active.stdout else "unknown"
+    e = enabled.stdout.strip() if enabled and enabled.stdout else "unknown"
+    return a, e
+
+
+def service_active(name: str) -> bool:
+    result = run(["systemctl", "--user", "is-active", "--quiet", name])
+    return bool(result and result.returncode == 0)
+
+
+def backup(paths: list[Path]) -> Path:
+    dest = BACKUP_ROOT / timestamp()
+    dest.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    for p in paths:
+        if not p.exists() or not p.is_file():
+            continue
+
+        try:
+            rel = p.relative_to(HOME)
+        except ValueError:
+            rel = Path(p.name)
+
+        out = dest / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, out)
+        copied += 1
+
+    if copied:
+        say(f"[backup] {copied} file(s) -> {dest}")
+    else:
+        say("[backup] nothing needed backing up")
+
+    return dest
+
+
+def steam_root() -> Path | None:
+    candidates = [
+        HOME / ".local/share/Steam",
+        HOME / ".steam/steam",
+        HOME / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+    ]
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if (resolved / "steamapps").is_dir():
+            return resolved
+
+    return None
+
+
+def workshop_root() -> Path | None:
+    root = steam_root()
+    if not root:
+        return None
+    return root / "steamapps/workshop/content/431960"
+
+
+def we_assets_root() -> Path | None:
+    root = steam_root()
+    if not root:
+        return None
+    return root / "steamapps/common/wallpaper_engine/assets"
+
+
+def parse_we_muted() -> bool | None:
+    if not WE_CONFIG.exists():
+        return None
+
+    section = ""
+    try:
+        for line in WE_CONFIG.read_text().splitlines():
+            stripped = line.strip()
+
+            if stripped.startswith("[") and stripped.endswith("]"):
+                section = stripped
+                continue
+
+            if section == "[renderer]" and stripped.startswith("muted ="):
+                value = stripped.split("=", 1)[1].strip().lower()
+                return value in ("true", "1", "yes", "on")
+    except Exception:
+        pass
+
+    return None
+
+
+def parse_ryogami_muted() -> bool | None:
+    if not RYOKU_CONFIG.exists():
+        return None
+
+    try:
+        data = json.loads(RYOKU_CONFIG.read_text())
+        if "wallpaperMute" in data:
+            return bool(data["wallpaperMute"])
+    except Exception:
+        pass
+
+    return None
+
+
+def audio_muted(default: bool = True) -> bool:
+    we_value = parse_we_muted()
+    if we_value is not None:
+        return we_value
+
+    ryoku_value = parse_ryogami_muted()
+    if ryoku_value is not None:
+        return ryoku_value
+
+    return default
+
+
+def write_we_audio(muted: bool) -> None:
+    WE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+
+    if not WE_CONFIG.exists():
+        ensure_we_config(muted=muted)
+        return
+
+    lines = WE_CONFIG.read_text().splitlines()
+    out = []
+    section = ""
+    saw_muted = False
+    saw_volume = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped
+
+        if section == "[renderer]" and stripped.startswith("muted ="):
+            out.append(f"muted = {'true' if muted else 'false'}")
+            saw_muted = True
+            continue
+
+        if section == "[renderer]" and stripped.startswith("volume ="):
+            out.append(f"volume = {'0.0' if muted else '1.0'}")
+            saw_volume = True
+            continue
+
+        out.append(line)
+
+    rebuilt = []
+    current = ""
+    inserted = False
+
+    for line in out:
+        stripped = line.strip()
+
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if current == "[renderer]" and not inserted:
+                if not saw_volume:
+                    rebuilt.append(f"volume = {'0.0' if muted else '1.0'}")
+                if not saw_muted:
+                    rebuilt.append(f"muted = {'true' if muted else 'false'}")
+                inserted = True
+
+            current = stripped
+
+        rebuilt.append(line)
+
+    if current == "[renderer]" and not inserted:
+        if not saw_volume:
+            rebuilt.append(f"volume = {'0.0' if muted else '1.0'}")
+        if not saw_muted:
+            rebuilt.append(f"muted = {'true' if muted else 'false'}")
+
+    WE_CONFIG.write_text("\n".join(rebuilt) + "\n")
+
+
+def write_ryogami_audio(muted: bool) -> None:
+    if not RYOKU_CONFIG.exists():
+        return
+
+    try:
+        data = json.loads(RYOKU_CONFIG.read_text())
+    except Exception as exc:
+        say(f"[warn] Could not parse {RYOKU_CONFIG}: {exc}")
+        return
+
+    data["wallpaperMute"] = bool(muted)
+    RYOKU_CONFIG.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def set_audio_muted(muted: bool, *, apply_now: bool = True) -> int:
+    write_we_audio(muted)
+    write_ryogami_audio(muted)
+
+    say("Wallpaper audio: " + ("MUTED" if muted else "UNMUTED"))
+
+    if not apply_now:
+        return 0
+
+    if service_active("we-layerd.service"):
+        systemctl("restart", "we-layerd.service")
+
+    if service_active("ryogami.service"):
+        systemctl("restart", "ryogami.service")
+        time.sleep(0.7)
+
+    sync()
+    return 0
+
+
+def toggle_audio() -> int:
+    return set_audio_muted(not audio_muted())
+
+
+def ensure_ryogami_config(*, muted: bool) -> None:
+    if not RYOKU_CONFIG.exists():
+        say(f"[warn] Ryogami config not found: {RYOKU_CONFIG}")
+        return
+
+    try:
+        data = json.loads(RYOKU_CONFIG.read_text())
+    except Exception as exc:
+        say(f"[warn] Could not parse {RYOKU_CONFIG}: {exc}")
+        return
+
+    data.setdefault("features", {})["steam"] = True
+    data["wallpaperMute"] = bool(muted)
+
+    RYOKU_CONFIG.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    say(
+        "[ok] Ryogami Steam support enabled; wallpaper audio "
+        + ("muted" if muted else "unmuted")
+    )
+
+
+def ensure_we_config(*, muted: bool) -> None:
+    assets = we_assets_root()
+    assets_text = str(assets) if assets else ""
+
+    WE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+
+    if not WE_CONFIG.exists():
+        WE_CONFIG.write_text(
+            f"""[general]
+interactive = false
+show_fps = false
+scale_mode = "cover"
+
+[renderer]
+library_path = ""
+source = ""
+assets_path = "{assets_text}"
+cache_path = "~/.cache/we-layerd/renderer"
+prefer_dmabuf = true
+allow_shm_fallback = true
+fps = 60
+max_fps = 60
+speed = 1.0
+volume = {"0.0" if muted else "1.0"}
+muted = {"true" if muted else "false"}
+msaa_samples = 1
+fill_mode = "cover"
+rotation_degrees = 0
+
+[integrations]
+media = true
+audio_spectrum = false
+audio_source = "@DEFAULT_MONITOR@"
+audio_sample_rate = 48000
+audio_update_hz = 30
+"""
+        )
+        say(f"[created] {WE_CONFIG}")
+        return
+
+    lines = WE_CONFIG.read_text().splitlines()
+    out = []
+    section = ""
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped
+
+        if section == "[renderer]" and stripped.startswith("assets_path =") and assets_text:
+            out.append(f'assets_path = "{assets_text}"')
+            continue
+
+        out.append(line)
+
+    WE_CONFIG.write_text("\n".join(out) + "\n")
+    write_we_audio(muted)
+
+    say(
+        "[ok] we-layerd configured; wallpaper audio "
+        + ("muted" if muted else "unmuted")
+    )
+
+
+def patch_gif_file(path: Path) -> bool:
+    if not path.exists():
+        say(f"[skip] missing GIF target: {path}")
+        return False
+
+    s = path.read_text()
+    original = s
+
+    anchor = "    function fillModeFor(img) {"
+    helper = (
+        "    function isGifSource(s) {\n"
+        '        return /\\.gif(?:\\?|$)/i.test(String(s || ""));\n'
+        "    }\n\n"
+        "    function fillModeFor(img) {"
+    )
+
+    if "function isGifSource(s)" not in s:
+        if anchor not in s:
+            say(f"[warn] GIF patch anchor missing: {path}")
+            return False
+        s = s.replace(anchor, helper, 1)
+
+    for ident in ("imgA", "imgB"):
+        old = "    Image {\n        id: " + ident + "\n"
+        new = "    AnimatedImage {\n        id: " + ident + "\n"
+
+        if old in s:
+            s = s.replace(old, new, 1)
+
+    for ident in ("imgA", "imgB"):
+        pos = s.find("id: " + ident)
+
+        if pos == -1:
+            continue
+
+        nearby = s[pos : pos + 500]
+
+        if "playing: view.isGifSource(source)" not in nearby:
+            old = (
+                "        id: " + ident + "\n"
+                "        anchors.fill: parent\n"
+                "        cache: false\n"
+                "        asynchronous: true\n"
+            )
+
+            if old in s:
+                s = s.replace(
+                    old,
+                    old + "        playing: view.isGifSource(source)\n",
+                    1,
+                )
+
+    s = s.replace(
+        "        id: srcA\n"
+        "        sourceItem: imgA\n"
+        "        hideSource: true\n"
+        "        live: false",
+        "        id: srcA\n"
+        "        sourceItem: imgA\n"
+        "        hideSource: true\n"
+        "        live: view.isGifSource(imgA.source)",
+        1,
+    )
+
+    s = s.replace(
+        "        id: srcB\n"
+        "        sourceItem: imgB\n"
+        "        hideSource: true\n"
+        "        live: false",
+        "        id: srcB\n"
+        "        sourceItem: imgB\n"
+        "        hideSource: true\n"
+        "        live: view.isGifSource(imgB.source)",
+        1,
+    )
+
+    if s != original:
+        path.write_text(s)
+        say(f"[patched] GIF support: {path}")
+        return True
+
+    say(f"[ok] GIF support already present: {path}")
+    return False
+
+
+def gif_patch() -> int:
+    for target in (ACTIVE_BACKDROP, SOURCE_BACKDROP):
+        patch_gif_file(target)
+    return 0
+
+
+def restore_native_live_rule(path: Path) -> None:
+    if not path.exists():
+        return
+
+    s = path.read_text()
+    original = s
+
+    patterns = [
+        r'wallpaperLive:\s*wallpaper\.live\s*\|\|\s*wallpaper\.wallpaperPath\.indexOf\("/Wallpaper Engine/"\)\s*!==\s*-1',
+        r'wallpaperLive:\s*wallpaper\.live\s*\|\|\s*\(wallpaper\.wallpaperPath\.indexOf\("/Wallpaper Engine/"\)\s*!==\s*-1\s*&&\s*wallpaper\.wallpaperPath\.indexOf\("\[scene\]"\)\s*!==\s*-1\)',
+    ]
+
+    for pat in patterns:
+        s = re.sub(pat, "wallpaperLive: wallpaper.live", s)
+
+    if s != original:
+        path.write_text(s)
+        say(f"[restored] native wallpaperLive rule: {path}")
+
+
+def move_synthetic_folder() -> None:
+    if not SYNTHETIC_DIR.is_dir():
+        return
+
+    dest_root = HOME / ".local/share/ryoku-backups"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    dest = dest_root / f"Wallpaper Engine.synthetic-old-{timestamp()}"
+
+    shutil.move(str(SYNTHETIC_DIR), str(dest))
+    say(f"[moved] old synthetic Wallpaper Engine folder -> {dest}")
+
+
+def selected_path() -> Path | None:
+    if not STATE_FILE.is_file():
+        return None
+
+    value = STATE_FILE.read_text(errors="replace").strip()
+
+    if value.startswith("file://"):
+        value = value[7:]
+
+    return Path(value) if value else None
+
+
+def selected_workshop(selected: Path | None):
+    root = workshop_root()
+
+    if not selected or not root:
+        return None, None
+
+    try:
+        rel = selected.resolve().relative_to(root.resolve())
+    except Exception:
+        return None, None
+
+    if not rel.parts:
+        return None, None
+
+    wid = rel.parts[0]
+
+    if not wid.isdigit():
+        return None, None
+
+    source = root / wid
+
+    return (wid, source) if source.is_dir() else (None, None)
+
+
+def read_project(source: Path) -> dict:
+    project = source / "project.json"
+
+    if not project.is_file():
+        return {}
+
+    try:
+        return json.loads(project.read_text(errors="replace"))
+    except Exception:
+        return {}
+
+
+def project_type(source: Path) -> str:
+    return str(read_project(source).get("type", "")).strip().lower()
+
+
+def project_title(source: Path) -> str:
+    return str(read_project(source).get("title", "")).strip()
+
+
+def set_we_source(source: Path) -> None:
+    if not WE_CONFIG.is_file():
+        raise RuntimeError(f"Missing we-layerd config: {WE_CONFIG}")
+
+    lines = WE_CONFIG.read_text().splitlines()
+    out = []
+    section = ""
+    replaced = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped
+
+        if section == "[renderer]" and stripped.startswith("source ="):
+            out.append(f'source = "{source}"')
+            replaced = True
+        else:
+            out.append(line)
+
+    if not replaced:
+        raise RuntimeError(f"renderer.source missing from {WE_CONFIG}")
+
+    WE_CONFIG.write_text("\n".join(out) + "\n")
+
+
+def kill_native_scene(source: Path) -> None:
+    needle = str(source)
+
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+
+        try:
+            cmd = (
+                (proc / "cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode(errors="replace")
+            )
+        except Exception:
+            continue
+
+        if "skwd-wall-vk" not in cmd:
+            continue
+        if "--scene" not in cmd:
+            continue
+        if needle not in cmd:
+            continue
+
+        try:
+            os.kill(int(proc.name), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def stop_we() -> None:
+    systemctl("stop", "we-layerd.service")
+
+
+def sync() -> int:
+    selected = selected_path()
+
+    if selected is None:
+        stop_we()
+        return 0
+
+    wid, source = selected_workshop(selected)
+
+    if source is None:
+        stop_we()
+        say(f"Ryoku native: {selected}")
+        return 0
+
+    kind = project_type(source)
+
+    say(f"Workshop: {wid}")
+    say(f"Type: {kind or 'unknown'}")
+
+    if kind != "scene":
+        stop_we()
+        say(f"Ryoku native Workshop renderer: {wid} {kind or 'unknown'}")
+        return 0
+
+    set_we_source(source)
+
+    systemctl("restart", "we-layerd.service")
+    time.sleep(0.7)
+
+    if not service_active("we-layerd.service"):
+        say("[error] we-layerd.service failed; native scene renderer left untouched")
+        return 1
+
+    current = selected_path()
+    current_id, _ = selected_workshop(current)
+
+    if current_id != wid:
+        stop_we()
+        return 0
+
+    for _ in range(10):
+        current = selected_path()
+        current_id, _ = selected_workshop(current)
+
+        if current_id != wid:
+            stop_we()
+            return 0
+
+        kill_native_scene(source)
+        time.sleep(0.10)
+
+    say(f"Wallpaper Engine scene -> we-layerd: {wid}")
+    say(f"Source: {source}")
+    return 0
+
+
+def write_units() -> None:
+    we_layerd = command_path("we-layerd")
+
+    if not we_layerd:
+        raise SystemExit("we-layerd was not found. Install/build we-layerd first.")
+
+    SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+
+    WE_SERVICE.write_text(
+        f"""[Unit]
+Description=Wallpaper Engine renderer via we-layerd
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart={we_layerd} run --config %h/.config/we-layerd/config.toml
+Restart=on-failure
+RestartSec=1
+"""
+    )
+
+    GIF_SERVICE.write_text(
+        f"""[Unit]
+Description=Reapply Ryoku GIF wallpaper support
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/{APP_NAME} gif-patch
+
+[Install]
+WantedBy=default.target
+"""
+    )
+
+    GIF_PATH.write_text(
+        """[Unit]
+Description=Watch Ryoku wallpaper renderer for updates
+
+[Path]
+PathChanged=%h/.config/quickshell/shell/modules/wallpaper/Backdrop.qml
+Unit=ryoku-gif-wallpaper-patch.service
+
+[Install]
+WantedBy=default.target
+"""
+    )
+
+    SYNC_SERVICE.write_text(
+        f"""[Unit]
+Description=Route Ryoku Wallpaper Engine scenes through we-layerd
+After=ryogami.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/{APP_NAME} sync
+
+[Install]
+WantedBy=default.target
+"""
+    )
+
+    SYNC_PATH.write_text(
+        """[Unit]
+Description=Watch Ryoku wallpaper selection for Wallpaper Engine scenes
+
+[Path]
+PathChanged=%h/.local/state/ryoku-wallpaper
+Unit=ryoku-we-sync.service
+
+[Install]
+WantedBy=default.target
+"""
+    )
+
+    say("[ok] systemd user units written")
+
+
+def install_self() -> None:
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+
+    current = Path(__file__).resolve()
+
+    if current != INSTALLED_SCRIPT:
+        shutil.copy2(current, INSTALLED_SCRIPT)
+
+    INSTALLED_SCRIPT.chmod(0o755)
+
+    alias = BIN_DIR / "ryoku-we"
+    try:
+        if alias.exists() or alias.is_symlink():
+            alias.unlink()
+        alias.symlink_to(INSTALLED_SCRIPT.name)
+    except OSError:
+        pass
+
+    say(f"[installed] {INSTALLED_SCRIPT}")
+
+
+def install() -> int:
+    say(f"{APP_NAME} v{VERSION}")
+    say()
+
+    if not command_path("ryoku"):
+        raise SystemExit("ryoku was not found in PATH.")
+    if not command_path("ryogami"):
+        raise SystemExit("ryogami was not found in PATH.")
+    if not command_path("we-layerd"):
+        raise SystemExit("we-layerd was not found in PATH or ~/.local/bin.")
+
+    root = steam_root()
+    say(f"[ok] Steam root: {root}" if root else "[warn] Steam root not detected")
+
+    current_mute = audio_muted(default=True)
+
+    backup(
+        [
+            ACTIVE_BACKDROP,
+            SOURCE_BACKDROP,
+            ACTIVE_SHELL,
+            SOURCE_SHELL,
+            RYOKU_CONFIG,
+            WE_CONFIG,
+            GIF_SERVICE,
+            GIF_PATH,
+            SYNC_SERVICE,
+            SYNC_PATH,
+            WE_SERVICE,
+            *OLD_HELPERS,
+        ]
+    )
+
+    install_self()
+
+    systemctl("disable", "--now", "ryoku-we-sync.path")
+    systemctl("disable", "--now", "ryoku-gif-wallpaper-patch.path")
+
+    move_synthetic_folder()
+    restore_native_live_rule(ACTIVE_SHELL)
+    restore_native_live_rule(SOURCE_SHELL)
+
+    ensure_ryogami_config(muted=current_mute)
+    ensure_we_config(muted=current_mute)
+    gif_patch()
+    write_units()
+
+    systemctl("daemon-reload")
+    systemctl("enable", "--now", "ryoku-gif-wallpaper-patch.service")
+    systemctl("enable", "--now", "ryoku-gif-wallpaper-patch.path")
+    systemctl("enable", "ryoku-we-sync.service")
+    systemctl("enable", "--now", "ryoku-we-sync.path")
+
+    if command_path("ryoku"):
+        run(["ryoku", "reload"], quiet=True)
+        time.sleep(1.5)
+
+    sync()
+
+    say()
+    say("Installed.")
+    say("  Pictures            -> native Ryoku")
+    say("  GIFs                -> native Ryoku AnimatedImage")
+    say("  Local videos        -> native Ryoku")
+    say("  Workshop videos     -> native Ryoku")
+    say("  Workshop scenes     -> we-layerd")
+    say("  Wallpaper audio     -> " + ("MUTED" if current_mute else "UNMUTED"))
+    say()
+    say(f"Launch TUI with: {APP_NAME}")
+    return 0
+
+
+def restart_we() -> int:
+    selected = selected_path()
+    wid, source = selected_workshop(selected)
+
+    if not source or project_type(source) != "scene":
+        say("Current wallpaper is not a Wallpaper Engine scene.")
+        return 0
+
+    set_we_source(source)
+    systemctl("restart", "we-layerd.service")
+    time.sleep(0.7)
+
+    if service_active("we-layerd.service"):
+        for _ in range(6):
+            kill_native_scene(source)
+            time.sleep(0.1)
+        say("we-layerd restarted.")
+        return 0
+
+    say("[error] we-layerd failed to restart.")
+    return 1
+
+
+def open_picker() -> int:
+    result = run(["ryogami", "wallpaper", "ui"], quiet=True)
+
+    if result is None:
+        say("[error] Could not launch Ryogami wallpaper picker.")
+        return 1
+
+    return result.returncode
+
+
+def uninstall() -> int:
+    say("Disabling Ryoku-WE automation...")
+
+    for unit in (
+        "ryoku-we-sync.path",
+        "ryoku-we-sync.service",
+        "ryoku-gif-wallpaper-patch.path",
+        "ryoku-gif-wallpaper-patch.service",
+    ):
+        systemctl("disable", "--now", unit)
+
+    systemctl("stop", "we-layerd.service")
+
+    for p in (SYNC_PATH, SYNC_SERVICE, GIF_PATH, GIF_SERVICE, WE_SERVICE):
+        try:
+            p.unlink()
+            say(f"[removed] {p}")
+        except FileNotFoundError:
+            pass
+
+    systemctl("daemon-reload")
+
+    say()
+    say("Automation removed.")
+    say("The current GIF QML patch and backups were intentionally kept.")
+    say(f"Backups: {BACKUP_ROOT}")
+    return 0
+
+
+def status_dict() -> dict:
+    selected = selected_path()
+    wid, source = selected_workshop(selected)
+
+    info = {
+        "selected": str(selected) if selected else "<none>",
+        "workshop_id": wid or "",
+        "project_type": "",
+        "project_title": "",
+        "muted": audio_muted(default=True),
+        "route": "Native Ryoku",
+        "units": {},
+        "renderers": [],
+        "ryoku_version": "",
+    }
+
+    if source:
+        info["project_type"] = project_type(source)
+        info["project_title"] = project_title(source)
+
+        if info["project_type"] == "scene":
+            info["route"] = "we-layerd" if service_active("we-layerd.service") else "scene pending/native"
+        else:
+            info["route"] = "Native Ryoku"
+
+    if command_path("ryoku"):
+        r = run(["ryoku", "--version"], capture=True)
+        if r and r.stdout:
+            info["ryoku_version"] = r.stdout.strip()
+
+    for unit in (
+        "ryoku-gif-wallpaper-patch.path",
+        "ryoku-we-sync.path",
+        "we-layerd.service",
+        "ryogami.service",
+        "ryoku-shell.service",
+    ):
+        info["units"][unit] = unit_state(unit)
+
+    proc = run(
+        ["pgrep", "-a", "-f", "skwd-wall-vk|skwd-paper-v2|we-layerd"],
+        capture=True,
+    )
+
+    if proc and proc.returncode == 0 and proc.stdout:
+        info["renderers"] = [line for line in proc.stdout.splitlines() if line.strip()]
+
+    return info
+
+
+def status() -> int:
+    info = status_dict()
+
+    say(f"{APP_NAME} v{VERSION}")
+
+    if info["ryoku_version"]:
+        say(f"Ryoku: {info['ryoku_version']}")
+
+    say(f"Wallpaper audio: {'MUTED' if info['muted'] else 'UNMUTED'}")
+    say(f"Selected: {info['selected']}")
+
+    if info["workshop_id"]:
+        say(f"Workshop ID: {info['workshop_id']}")
+        say(f"Title: {info['project_title'] or '<unknown>'}")
+        say(f"Project type: {info['project_type'] or 'unknown'}")
+
+    say(f"Route: {info['route']}")
+    say()
+
+    for unit, (active, enabled) in info["units"].items():
+        say(f"{unit}: active={active}, enabled={enabled}")
+
+    say()
+
+    if WE_CONFIG.exists():
+        section = ""
+        for line in WE_CONFIG.read_text().splitlines():
+            stripped = line.strip()
+
+            if stripped.startswith("[") and stripped.endswith("]"):
+                section = stripped
+
+            if section == "[renderer]" and stripped.startswith(("source =", "volume =", "muted =")):
+                say("we-layerd " + stripped)
+
+    say()
+
+    if info["renderers"]:
+        say("Renderers:")
+        for line in info["renderers"]:
+            say(line)
+    else:
+        say("Renderers: none")
+
+    return 0
+
+
+def capture_action(func, *args, **kwargs) -> tuple[int, str]:
+    buf = io.StringIO()
+
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = func(*args, **kwargs)
+
+        if rc is None:
+            rc = 0
+
+        return int(rc), buf.getvalue().strip()
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        if exc.code and not isinstance(exc.code, int):
+            print(exc.code, file=buf)
+        return code, buf.getvalue().strip()
+    except Exception as exc:
+        return 1, (buf.getvalue() + f"\n{type(exc).__name__}: {exc}").strip()
+
+
+def tui_addstr(stdscr, y, x, text, attr=0):
+    h, w = stdscr.getmaxyx()
+
+    if y < 0 or y >= h or x >= w:
+        return
+
+    max_len = max(0, w - x - 1)
+
+    try:
+        stdscr.addnstr(y, x, str(text), max_len, attr)
+    except curses.error:
+        pass
+
+
+def modal(stdscr, title: str, body: str) -> None:
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        tui_addstr(stdscr, 1, 2, f"{APP_NAME} — {title}", curses.A_BOLD)
+
+        body_lines = []
+        width = max(20, w - 6)
+
+        for raw in (body or "(no output)").splitlines():
+            wrapped = textwrap.wrap(raw, width=width) or [""]
+            body_lines.extend(wrapped)
+
+        max_body = max(1, h - 6)
+        shown = body_lines[-max_body:]
+
+        for i, line in enumerate(shown):
+            tui_addstr(stdscr, 3 + i, 3, line)
+
+        tui_addstr(stdscr, h - 2, 2, "Press Enter / Esc / q to return", curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+
+        if key in (10, 13, 27, ord("q"), ord("Q")):
+            return
+
+
+def confirm(stdscr, prompt: str) -> bool:
+    stdscr.erase()
+    tui_addstr(stdscr, 2, 2, APP_NAME, curses.A_BOLD)
+    tui_addstr(stdscr, 4, 4, prompt)
+    tui_addstr(stdscr, 6, 4, "Press y to confirm, anything else to cancel.", curses.A_DIM)
+    stdscr.refresh()
+    return stdscr.getch() in (ord("y"), ord("Y"))
+
+
+def draw_tui(stdscr, selected_index: int):
+    info = status_dict()
+    muted = info["muted"]
+
+    menu = [
+        ("picker", "Open Ryoku wallpaper picker", open_picker),
+        ("mute", "Unmute wallpaper audio" if muted else "Mute wallpaper audio", toggle_audio),
+        ("sync", "Sync current wallpaper / renderer", sync),
+        ("gif", "Reapply GIF support", gif_patch),
+        ("we", "Restart Wallpaper Engine renderer", restart_we),
+        ("repair", "Install / repair Ryoku-WE support", install),
+        ("status", "Detailed status", status),
+        ("logo", "Show Ryoku-WE logo", print_logo),
+        ("uninstall", "Uninstall automation", uninstall),
+        ("quit", "Quit", lambda: 0),
+    ]
+
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+
+    if h < 20 or w < 72:
+        tui_addstr(stdscr, 1, 2, f"{APP_NAME} needs roughly 72x20 terminal space.", curses.A_BOLD)
+        tui_addstr(stdscr, 3, 2, "Resize the terminal, or use CLI commands such as:")
+        tui_addstr(stdscr, 5, 4, f"{APP_NAME} status")
+        tui_addstr(stdscr, 6, 4, f"{APP_NAME} toggle-mute")
+        tui_addstr(stdscr, 7, 4, f"{APP_NAME} repair")
+        return menu
+
+    title = f" {APP_NAME} "
+    tui_addstr(stdscr, 1, 2, "═" * (w - 4), curses.A_DIM)
+    tui_addstr(stdscr, 1, max(3, (w - len(title)) // 2), title, curses.A_BOLD)
+    tui_addstr(stdscr, 2, 3, f"Unified Ryoku + Wallpaper Engine support  v{VERSION}", curses.A_DIM)
+
+    audio_text = "MUTED" if muted else "UNMUTED"
+    route = info["route"]
+    selected = info["project_title"] or Path(info["selected"]).name or info["selected"]
+
+    tui_addstr(stdscr, 4, 4, "Wallpaper audio :", curses.A_BOLD)
+    tui_addstr(stdscr, 4, 22, audio_text)
+
+    tui_addstr(stdscr, 5, 4, "Current route   :", curses.A_BOLD)
+    tui_addstr(stdscr, 5, 22, route)
+
+    tui_addstr(stdscr, 6, 4, "Selected        :", curses.A_BOLD)
+    tui_addstr(stdscr, 6, 22, selected)
+
+    if info["workshop_id"]:
+        meta = f"Workshop {info['workshop_id']}  [{info['project_type'] or 'unknown'}]"
+        tui_addstr(stdscr, 7, 22, meta, curses.A_DIM)
+
+    we_active = info["units"]["we-layerd.service"][0]
+    gif_watch = info["units"]["ryoku-gif-wallpaper-patch.path"][0]
+    sync_watch = info["units"]["ryoku-we-sync.path"][0]
+
+    tui_addstr(stdscr, 9, 4, f"we-layerd: {we_active}", curses.A_DIM)
+    tui_addstr(stdscr, 9, 26, f"GIF watcher: {gif_watch}", curses.A_DIM)
+    tui_addstr(stdscr, 9, 50, f"Router: {sync_watch}", curses.A_DIM)
+
+    tui_addstr(stdscr, 11, 4, "Actions", curses.A_BOLD)
+
+    start_y = 12
+    for i, (_, label, _) in enumerate(menu):
+        attr = curses.A_REVERSE | curses.A_BOLD if i == selected_index else 0
+        prefix = "▶ " if i == selected_index else "  "
+        tui_addstr(stdscr, start_y + i, 6, prefix + label, attr)
+
+    footer = "↑/↓ navigate   Enter select   m mute/unmute   s sync   r repair   q quit"
+    tui_addstr(stdscr, h - 2, 3, footer, curses.A_DIM)
+
+    return menu
+
+
+
+def logo_splash(stdscr) -> None:
+    """Show the full binary Ryoku-WE logo when the terminal is large enough."""
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    lines = LOGO.splitlines()
+
+    # The logo is 60 columns by 27 lines. Preserve it exactly; never scale it.
+    if h >= len(lines) + 5 and w >= 64:
+        start_y = max(1, (h - len(lines) - 2) // 2)
+        start_x = max(1, (w - 60) // 2)
+
+        for i, line in enumerate(lines):
+            tui_addstr(stdscr, start_y + i, start_x, line, curses.A_BOLD)
+
+        title = f"{APP_NAME}  v{VERSION}"
+        tui_addstr(
+            stdscr,
+            start_y + len(lines) + 1,
+            max(1, (w - len(title)) // 2),
+            title,
+            curses.A_BOLD,
+        )
+        stdscr.refresh()
+
+        # Brief splash. Any key skips immediately.
+        stdscr.timeout(900)
+        stdscr.getch()
+        stdscr.timeout(1000)
+    else:
+        # Small terminals keep the main TUI usable. The exact logo remains
+        # available with `Ryoku-WE logo`.
+        title = f"{APP_NAME}  v{VERSION}"
+        tui_addstr(stdscr, max(1, h // 2 - 1), max(1, (w - len(title)) // 2), title, curses.A_BOLD)
+        tui_addstr(stdscr, max(2, h // 2 + 1), 2, "Tip: run `Ryoku-WE logo` to print the full binary logo.", curses.A_DIM)
+        stdscr.refresh()
+        stdscr.timeout(650)
+        stdscr.getch()
+        stdscr.timeout(1000)
+
+
+
+def tui(stdscr) -> int:
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.timeout(1000)
+
+    logo_splash(stdscr)
+
+    index = 0
+
+    while True:
+        menu = draw_tui(stdscr, index)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+
+        if key == -1:
+            continue
+        if key in (ord("q"), ord("Q")):
+            return 0
+        if key in (curses.KEY_UP, ord("k")):
+            index = (index - 1) % len(menu)
+            continue
+        if key in (curses.KEY_DOWN, ord("j")):
+            index = (index + 1) % len(menu)
+            continue
+
+        if key in (ord("m"), ord("M")):
+            rc, out = capture_action(toggle_audio)
+            modal(stdscr, "Audio toggle", out or f"Exit code: {rc}")
+            continue
+
+        if key in (ord("s"), ord("S")):
+            rc, out = capture_action(sync)
+            modal(stdscr, "Sync", out or f"Exit code: {rc}")
+            continue
+
+        if key in (ord("r"), ord("R")):
+            rc, out = capture_action(install)
+            modal(stdscr, "Install / repair", out or f"Exit code: {rc}")
+            continue
+
+        if key not in (10, 13):
+            continue
+
+        key_name, label, func = menu[index]
+
+        if key_name == "quit":
+            return 0
+
+        if key_name == "uninstall" and not confirm(
+            stdscr, "Disable and remove Ryoku-WE automation?"
+        ):
+            continue
+
+        if key_name == "picker":
+            capture_action(open_picker)
+            continue
+
+        if key_name == "logo":
+            splash(stdscr)
+            continue
+
+        rc, out = capture_action(func)
+        modal(stdscr, label, out or f"Exit code: {rc}")
+
+
+
+def splash(stdscr) -> None:
+    """Show the Ryoku-WE binary logo when the terminal is large enough."""
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    lines = LOGO.splitlines()
+
+    # Full logo is 60 columns x 27 rows. Show it only when it fits comfortably.
+    if h >= len(lines) + 8 and w >= 68:
+        start_y = max(1, (h - len(lines) - 4) // 2)
+        for i, line in enumerate(lines):
+            x = max(0, (w - len(line)) // 2)
+            tui_addstr(stdscr, start_y + i, x, line, curses.A_DIM)
+
+        title = f"{APP_NAME}  v{VERSION}"
+        tui_addstr(stdscr, start_y + len(lines) + 1, max(0, (w - len(title)) // 2), title, curses.A_BOLD)
+        hint = "Ryoku + GIF + Wallpaper Engine"
+        tui_addstr(stdscr, start_y + len(lines) + 2, max(0, (w - len(hint)) // 2), hint, curses.A_DIM)
+        stdscr.refresh()
+        time.sleep(0.8)
+    else:
+        title = f"{APP_NAME}  v{VERSION}"
+        tui_addstr(stdscr, max(1, h // 2 - 1), max(0, (w - len(title)) // 2), title, curses.A_BOLD)
+        hint = "Ryoku + GIF + Wallpaper Engine"
+        tui_addstr(stdscr, max(2, h // 2 + 1), max(0, (w - len(hint)) // 2), hint, curses.A_DIM)
+        stdscr.refresh()
+        time.sleep(0.5)
+
+def launch_tui() -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        say(f"{APP_NAME}: TUI requires a terminal.")
+        say(f"Try: {APP_NAME} status")
+        return 1
+
+    try:
+        def _run(stdscr):
+            curses.curs_set(0)
+            splash(stdscr)
+            return tui(stdscr)
+        return curses.wrapper(_run)
+    except KeyboardInterrupt:
+        return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="TUI + automation for Ryoku GIF/video/Wallpaper Engine support",
+    )
+
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="tui",
+        choices=[
+            "tui",
+            "install",
+            "repair",
+            "status",
+            "sync",
+            "gif-patch",
+            "mute",
+            "unmute",
+            "toggle-mute",
+            "restart-we",
+            "picker",
+            "logo",
+            "uninstall",
+        ],
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "tui":
+        return launch_tui()
+    if args.command in ("install", "repair"):
+        return install()
+    if args.command == "status":
+        return status()
+    if args.command == "sync":
+        return sync()
+    if args.command == "gif-patch":
+        return gif_patch()
+    if args.command == "mute":
+        return set_audio_muted(True)
+    if args.command == "unmute":
+        return set_audio_muted(False)
+    if args.command == "toggle-mute":
+        return toggle_audio()
+    if args.command == "restart-we":
+        return restart_we()
+    if args.command == "picker":
+        return open_picker()
+    if args.command == "logo":
+        return print_logo()
+    if args.command == "uninstall":
+        return uninstall()
+
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
