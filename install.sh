@@ -1,96 +1,128 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-REPO="zarzorr69/ryoku-we"
-BRANCH="${RYOKU_WE_BRANCH:-main}"
-RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-RYOKU_INSTALL_URL="https://raw.githubusercontent.com/ryoku-dev/ryoku/main/ryoku-shell-installer/install.sh"
-WE_REPO="https://github.com/Aromatic05/we-layerd.git"
-
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ryoku-we"
-WE_SRC="$CACHE/we-layerd"
-TMP="$(mktemp -t Ryoku-WE.XXXXXX)"
-trap 'rm -f "$TMP"' EXIT
-
-say(){ printf '%s\n' "$*"; }
-warn(){ printf 'WARNING: %s\n' "$*" >&2; }
-die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-have(){ command -v "$1" >/dev/null 2>&1; }
-
-[[ "$(uname -s)" == "Linux" ]] || die "Ryoku-WE supports Linux only."
-[[ "$EUID" -ne 0 ]] || die "Run this installer as your normal user, not root."
-
-ensure_sudo(){ have sudo || die "sudo is required for missing system packages."; }
-
-detect_pm() {
-    if have pacman; then PM=pacman
-    elif have apt-get; then PM=apt
-    elif have dnf5; then PM=dnf
-    elif have dnf; then PM=dnf
-    elif have yum; then PM=yum
-    elif have zypper; then PM=zypper
-    elif have xbps-install; then PM=xbps
-    elif have apk; then PM=apk
-    elif have emerge; then PM=emerge
-    elif have eopkg; then PM=eopkg
-    elif have swupd; then PM=swupd
-    elif have urpmi; then PM=urpmi
-    elif have slackpkg; then PM=slackpkg
-    elif have nix; then PM=nix
-    elif have guix; then PM=guix
-    elif have brew; then PM=brew
-    elif have pkg; then PM=pkg
-    elif have opkg; then PM=opkg
-    else PM=unknown
-    fi
 }
 
-pacman_install() {
-    local repo=() aur=() p
-    for p in "$@"; do
-        if pacman -T "$p" >/dev/null 2>&1; then
-            if pacman -Si "$p" >/dev/null 2>&1; then repo+=("$p"); else aur+=("$p"); fi
-        fi
-    done
-    if ((${#repo[@]})); then
-        ensure_sudo
-        sudo pacman -S --needed --noconfirm "${repo[@]}"
+prepare_cef_dxc() {
+    local mode="$1"
+    [[ "$mode" == none ]] && return
+
+    if [[ "$mode" == dxc ]]; then
+        ./package/common/fetch-dependencies.sh dxc
+        source ./package/common/versions.env
+        mkdir -p .deps/dxc
+        rm -rf .deps/dxc/*
+        tar -xzf "${WE_LAYERD_DOWNLOAD_CACHE}/${DXC_ARCHIVE}" -C .deps/dxc
+        export CMAKE_PREFIX_PATH="$PWD/.deps/dxc${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+        export PATH="$PWD/.deps/dxc/bin:$PATH"
+        return
     fi
-    if ((${#aur[@]})); then
-        if have yay; then yay -S --needed --noconfirm "${aur[@]}"
-        elif have paru; then paru -S --needed --noconfirm "${aur[@]}"
-        else
-            printf 'Missing AUR packages:\n' >&2
-            printf '  %s\n' "${aur[@]}" >&2
-            die "Install yay/paru, then rerun."
-        fi
-    fi
+
+    ./package/common/fetch-dependencies.sh all
+    source ./package/common/versions.env
+    mkdir -p .deps/cef .deps/dxc
+    rm -rf .deps/cef/* .deps/dxc/*
+    tar -xjf "${WE_LAYERD_DOWNLOAD_CACHE}/${CEF_ARCHIVE}" -C .deps/cef --strip-components=1
+    tar -xzf "${WE_LAYERD_DOWNLOAD_CACHE}/${DXC_ARCHIVE}" -C .deps/dxc
+    export CEF_ROOT="$PWD/.deps/cef"
+    export CMAKE_PREFIX_PATH="$PWD/.deps/dxc${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+    export PATH="$PWD/.deps/dxc/bin:$PATH"
 }
 
-best_effort() {
-    local p
-    for p in "$@"; do
+build_we_layerd() {
+    mkdir -p "$CACHE"
+
+    if [[ -d "$WE_SRC/.git" ]]; then
+        git -C "$WE_SRC" fetch --depth=1 origin main
+        git -C "$WE_SRC" reset --hard origin/main
+        git -C "$WE_SRC" submodule sync --recursive
+        git -C "$WE_SRC" submodule update --init --recursive
+    else
+        rm -rf "$WE_SRC"
+        git clone --depth=1 --recurse-submodules "$WE_REPO" "$WE_SRC"
+    fi
+
+    (
+        cd "$WE_SRC"
+        local mode=all
         case "$PM" in
-            zypper) sudo zypper --non-interactive install -y "$p" >/dev/null 2>&1 || warn "zypper: $p unavailable" ;;
-            xbps) sudo xbps-install -Sy "$p" >/dev/null 2>&1 || warn "xbps: $p unavailable" ;;
-            apk) sudo apk add "$p" >/dev/null 2>&1 || warn "apk: $p unavailable" ;;
-            emerge) sudo emerge --noreplace "$p" >/dev/null 2>&1 || warn "emerge: $p unavailable" ;;
-            eopkg) sudo eopkg install -y "$p" >/dev/null 2>&1 || warn "eopkg: $p unavailable" ;;
-            urpmi) sudo urpmi --auto "$p" >/dev/null 2>&1 || warn "urpmi: $p unavailable" ;;
-            slackpkg) sudo slackpkg -batch=on -default_answer=y install "$p" >/dev/null 2>&1 || warn "slackpkg: $p unavailable" ;;
-            guix) guix install "$p" >/dev/null 2>&1 || warn "guix: $p unavailable" ;;
-            brew) brew list "$p" >/dev/null 2>&1 || brew install "$p" >/dev/null 2>&1 || warn "brew: $p unavailable" ;;
-            pkg) sudo pkg install -y "$p" >/dev/null 2>&1 || warn "pkg: $p unavailable" ;;
-            opkg) sudo opkg install "$p" >/dev/null 2>&1 || warn "opkg: $p unavailable" ;;
+            pacman) mode=none ;;
+            dnf|yum) mode=dxc ;;
+            apt) mode=all ;;
+            *) mode=all ;;
         esac
-    done
+
+        prepare_cef_dxc "$mode"
+        git submodule update --init --recursive
+        cargo build --locked --workspace --release
+        cargo xtask install
+    )
+
+    export PATH="$HOME/.local/bin:$PATH"
+    hash -r
 }
 
-install_core() {
-    say "==> Checking core dependencies..."
-    case "$PM" in
-        pacman)
-            pacman_install curl ca-certificates python git gcc cmake pkgconf procps-ng
-            ;;
-        apt)
-            ensure_sudo
+ensure_we_layerd() {
+    if have we-layerd; then
+        say "==> we-layerd detected: $(command -v we-layerd)"
+        return
+    fi
+
+    if [[ "$PM" == nix ]]; then
+        say "==> Installing we-layerd via upstream Nix flake..."
+        nix --extra-experimental-features 'nix-command flakes' profile install github:Aromatic05/we-layerd
+        export PATH="$HOME/.nix-profile/bin:$PATH"
+        hash -r
+        have we-layerd || die "Nix install completed but we-layerd is missing."
+        return
+    fi
+
+    install_we_deps
+    ensure_rust
+    say "==> Building we-layerd from upstream..."
+    build_we_layerd
+    have we-layerd || die "we-layerd build completed but executable is missing."
+}
+
+check_environment() {
+    have systemctl || die "Ryoku-WE requires systemd user services."
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] || warn "WAYLAND_DISPLAY is not set."
+
+    local p
+    for p in \
+        "$HOME/.local/share/Steam/steamapps/workshop/content/431960" \
+        "$HOME/.steam/steam/steamapps/workshop/content/431960" \
+        "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/workshop/content/431960"
+    do
+        if [[ -d "$p" ]]; then
+            say "==> Wallpaper Engine Workshop detected: $p"
+            return
+        fi
+    done
+    warn "Wallpaper Engine Workshop content not found; local wallpapers still work."
+}
+
+install_ryoku_we() {
+    say "==> Downloading Ryoku-WE..."
+    curl -fsSL "${RAW}/Ryoku-WE" -o "$TMP"
+    chmod +x "$TMP"
+    say "==> Installing / repairing Ryoku-WE..."
+    "$TMP" install
+}
+
+main() {
+    detect_pm
+    say "Ryoku-WE dependency bootstrap"
+    say "============================"
+    say "Package manager: $PM"
+    say
+
+    install_core
+    ensure_ryoku
+    ensure_we_layerd
+    check_environment
+    install_ryoku_we
+
+    say
+    say "Ryoku-WE installed successfully."
+    say "Launch with: Ryoku-WE"
+}
+
+main "$@"
